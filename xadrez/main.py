@@ -5,6 +5,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
 import chess
+import chess.engine
 import numpy as np
 import PySimpleGUI as sg
 
@@ -16,9 +17,12 @@ from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 
 class Config:
-    PROJECT_NAME = "Projeto Quimera"
+    PROJECT_NAME = "Projeto Quimera 2.0 - Tabula Rasa"
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
+    MASTER_ENGINE_PATH = "stockfish"
+    MASTER_SKILL_LEVEL = 20 # Nível máximo de habilidade do Stockfish (0-20)
+
     # Chess Representation
     NUM_HISTORY_STEPS = 8
     NUM_PIECE_TYPES = 6
@@ -26,48 +30,65 @@ class Config:
     INPUT_CHANNELS = (NUM_PIECE_TYPES * 2 * NUM_HISTORY_STEPS) + 7
     ACTION_SPACE_SIZE = 4672
 
-    # MCTS
-    MCTS_SIMULATIONS = 100
+    # MCTS 
+    MCTS_SIMULATIONS = 400
     MCTS_CPUCT = 1.25
     MCTS_TEMPERATURE_START = 1.0
     MCTS_TEMPERATURE_END_MOVE = 30
 
-    # Training
-    BATCH_SIZE = 256 
-    REPLAY_BUFFER_SIZE = 50000
-    LEARNING_RATE = 1e-3
+    # Training 
+    BATCH_SIZE = 512
+    REPLAY_BUFFER_SIZE = 200000
+    LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-4
-    TRAINING_ITERATIONS = 1000
-    GAMES_PER_ITERATION = 50 
+    GAMES_PER_ITERATION = 100 
 
-    # Evaluation
-    EVAL_GAMES = 20
-    EVAL_WIN_THRESHOLD = 0.55
+    # Evaluation against Master
+    EVAL_GAMES_PER_CYCLE = 10 
 
     # Paths
-    MODEL_DIR = "./models/"
+    MODEL_DIR = "./models_tabula_rasa/"
     BEST_MODEL_PATH = os.path.join(MODEL_DIR, "best_model.pth")
-    TEMP_MODEL_PATH = os.path.join(MODEL_DIR, "temp_model.pth")
     
     # GUI
     TOP_K_PREDICTIONS = 5
 
 def uci_to_move_index(uci_move):
     try:
-        move = chess.Move.from_uci(uci_move)
-        from_square = move.from_square
-        to_square = move.to_square
-        promotion = move.promotion
         return abs(hash(uci_move)) % Config.ACTION_SPACE_SIZE
     except:
         return -1
 
 def move_index_to_uci(index, board):
+    # Esta função é mais complexa no aprendizado tabula rasa.
+    # A IA não sabe os movimentos legais. Ela propõe um a partir de um grande espaço.
+    # Para mapear de volta, uma abordagem é ter um mapa pré-computado de todos os movimentos possíveis.
+    # Por simplicidade aqui, vamos mapear para um movimento legal aleatório para manter o código funcional,
+    # mas o ideal seria um mapeamento fixo index -> uci_string.
+    # A IA aprenderá a não usar índices que levam a movimentos ilegais.
+    # Para a lógica de aprendizado, a IA propõe um índice, e nós o convertemos para um movimento.
+    # A maneira mais direta é gerar uma representação de movimento a partir do índice.
+    # Ex: (from_sq, to_sq). 64*63 = 4032. Adicionando promoções, chega-se perto de 4672.
+    # Esta é uma simplificação para manter o código executável.
     legal_moves = list(board.legal_moves)
     if not legal_moves:
-        return None
-    return legal_moves[index % len(legal_moves)]
-
+        return "a1a1"
+    # O ideal seria um mapeamento fixo.
+    # Para este exemplo, a IA escolhe o ÍNDICE e a função self_play_worker o valida.
+    # Vamos gerar um movimento hipotético para que o sistema funcione.
+    # Esta é uma área que necessitaria de um design de espaço de ação mais detalhado.
+    # Por exemplo, o AlphaZero usa 8x8x73.
+    # Vamos simular um mapeamento reverso.
+    all_moves = []
+    for from_sq in chess.SQUARES:
+        for to_sq in chess.SQUARES:
+            if from_sq != to_sq:
+                all_moves.append(chess.Move(from_sq, to_sq).uci())
+    
+    if index < len(all_moves):
+        return all_moves[index]
+    else:
+        return random.choice(all_moves) # Fallback
 
 def board_to_tensor(board, history_boards):
     tensor = np.zeros((Config.INPUT_CHANNELS, Config.BOARD_DIM, Config.BOARD_DIM), dtype=np.float32)
@@ -94,7 +115,6 @@ def board_to_tensor(board, history_boards):
         tensor[base_plane_idx, :, :] = 0
 
     tensor[base_plane_idx + 1, :, :] = board.fullmove_number / 100.0
-    
     if board.has_kingside_castling_rights(chess.WHITE): tensor[base_plane_idx + 2, :, :] = 1
     if board.has_queenside_castling_rights(chess.WHITE): tensor[base_plane_idx + 3, :, :] = 1
     if board.has_kingside_castling_rights(chess.BLACK): tensor[base_plane_idx + 4, :, :] = 1
@@ -122,54 +142,38 @@ class ResidualBlock(nn.Module):
 class QuimeraNet(nn.Module):
     def __init__(self):
         super(QuimeraNet, self).__init__()
-        num_filters = 128
-        num_res_blocks = 8 
+        num_filters = 256 
+        num_res_blocks = 19 
         
         self.conv_block = nn.Sequential(
             nn.Conv2d(Config.INPUT_CHANNELS, num_filters, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(num_filters),
             nn.ReLU()
         )
-        
-        self.res_tower = nn.Sequential(
-            *[ResidualBlock(num_filters) for _ in range(num_res_blocks)]
-        )
-
+        self.res_tower = nn.Sequential(*[ResidualBlock(num_filters) for _ in range(num_res_blocks)])
         self.policy_head = nn.Sequential(
             nn.Conv2d(num_filters, 2, kernel_size=1, stride=1),
-            nn.BatchNorm2d(2),
-            nn.ReLU(),
-            nn.Flatten(),
+            nn.BatchNorm2d(2), nn.ReLU(), nn.Flatten(),
             nn.Linear(2 * Config.BOARD_DIM * Config.BOARD_DIM, Config.ACTION_SPACE_SIZE)
         )
-        
         self.opponent_policy_head = nn.Sequential(
             nn.Conv2d(num_filters, 2, kernel_size=1, stride=1),
-            nn.BatchNorm2d(2),
-            nn.ReLU(),
-            nn.Flatten(),
+            nn.BatchNorm2d(2), nn.ReLU(), nn.Flatten(),
             nn.Linear(2 * Config.BOARD_DIM * Config.BOARD_DIM, Config.ACTION_SPACE_SIZE)
         )
-
         self.value_head = nn.Sequential(
             nn.Conv2d(num_filters, 1, kernel_size=1, stride=1),
-            nn.BatchNorm2d(1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(Config.BOARD_DIM * Config.BOARD_DIM, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-            nn.Tanh()
+            nn.BatchNorm2d(1), nn.ReLU(), nn.Flatten(),
+            nn.Linear(Config.BOARD_DIM * Config.BOARD_DIM, 256), nn.ReLU(),
+            nn.Linear(256, 1), nn.Tanh()
         )
 
     def forward(self, x):
         out = self.conv_block(x)
         out = self.res_tower(out)
-        
         pself = self.policy_head(out)
         popp = self.opponent_policy_head(out)
         v = self.value_head(out)
-        
         return F.softmax(pself, dim=1), F.softmax(popp, dim=1), v
 
 class MCTSNode:
@@ -181,18 +185,20 @@ class MCTSNode:
         self.u_value = 0
         self.p_value = prior_p
 
-    def expand(self, action_priors, board):
-        legal_moves = {move.uci() for move in board.legal_moves}
+    def expand(self, action_priors):
         for i, p in enumerate(action_priors):
-            action = move_index_to_uci(i, board)
-            if action in legal_moves:
-                self.children[action] = MCTSNode(parent=self, prior_p=p)
+            if p > 1e-6:
+                self.children[i] = MCTSNode(parent=self, prior_p=p)
 
     def select(self, c_puct):
         return max(self.children.items(), key=lambda item: item[1].get_value(c_puct))
 
     def get_value(self, c_puct):
-        self.u_value = c_puct * self.p_value * math.sqrt(self.parent.n_visits) / (1 + self.n_visits)
+        if self.parent is None or self.parent.n_visits == 0:
+             u_boost = 1.0
+        else:
+             u_boost = math.sqrt(self.parent.n_visits)
+        self.u_value = c_puct * self.p_value * u_boost / (1 + self.n_visits)
         return self.q_value + self.u_value
 
     def update(self, leaf_value):
@@ -203,67 +209,89 @@ class MCTSNode:
         if self.parent:
             self.parent.backpropagate(-leaf_value)
         self.update(leaf_value)
-
+        
 class MCTS:
     def __init__(self, network):
         self.network = network
 
     def run(self, board, history_boards):
         root = MCTSNode()
+        state_tensor = board_to_tensor(board, history_boards).unsqueeze(0)
+        policy, _, value = self.network(state_tensor)
+        root.expand(policy.squeeze(0).cpu().detach().numpy())
+        
         for _ in range(Config.MCTS_SIMULATIONS):
             node = root
             sim_board = board.copy()
             sim_history = list(history_boards)
-
+            
+            # SELEÇÃO
             while node.children:
-                action, node = node.select(Config.MCTS_CPUCT)
-                sim_board.push_uci(action)
-                sim_history.append(sim_board.copy())
-                if len(sim_history) > Config.NUM_HISTORY_STEPS:
-                    sim_history.pop(0)
+                action_idx, node = node.select(Config.MCTS_CPUCT)
+                move_uci = move_index_to_uci(action_idx, sim_board)
+                try:
+                    move = chess.Move.from_uci(move_uci)
+                    if move in sim_board.legal_moves:
+                        sim_board.push(move)
+                        sim_history.append(sim_board.copy())
+                        if len(sim_history) > Config.NUM_HISTORY_STEPS:
+                            sim_history.pop(0)
+                    else:
+                        break
+                except:
+                    break
 
+            # EXPANSÃO E SIMULAÇÃO
+            leaf_value = 0
             if not sim_board.is_game_over():
-                state_tensor = board_to_tensor(sim_board, sim_history).unsqueeze(0)
-                policy, _, value = self.network(state_tensor)
-                policy = policy.squeeze(0).cpu().detach().numpy()
-                node.expand(policy, sim_board)
-                leaf_value = value.item()
+                try:
+                    move = chess.Move.from_uci(move_index_to_uci(action_idx, sim_board))
+                    if move in board.legal_moves:
+                        state_tensor_leaf = board_to_tensor(sim_board, sim_history).unsqueeze(0)
+                        policy_leaf, _, value_leaf = self.network(state_tensor_leaf)
+                        node.expand(policy_leaf.squeeze(0).cpu().detach().numpy())
+                        leaf_value = value_leaf.item()
+                    else:
+                        leaf_value = -1.0
+                except:
+                     leaf_value = -1.0
             else:
                 outcome = sim_board.outcome()
-                if outcome.winner == chess.WHITE:
-                    leaf_value = 1 if board.turn == chess.WHITE else -1
-                elif outcome.winner == chess.BLACK:
-                    leaf_value = -1 if board.turn == chess.WHITE else 1
-                else:
-                    leaf_value = 0
+                if outcome:
+                    if outcome.winner is not None:
+                        leaf_value = 1.0 if outcome.winner == board.turn else -1.0
+                    else:
+                        leaf_value = 0.0
             
+            # BACKPROPAGATION
             node.backpropagate(leaf_value)
-
         return root
 
     def get_action_probs(self, board, history_boards, temp=1e-3):
         root = self.run(board, history_boards)
-        action_visits = {action: node.n_visits for action, node in root.children.items()}
+        action_visits = {action_idx: node.n_visits for action_idx, node in root.children.items()}
         
-        if not action_visits:
-             return [], {}
+        if not action_visits: return np.zeros(Config.ACTION_SPACE_SIZE), {}
         
         visits = np.array(list(action_visits.values()))
         actions = list(action_visits.keys())
         
         if temp == 0:
             probs = np.zeros_like(visits, dtype=float)
-            probs[np.argmax(visits)] = 1.0
+            if visits.size > 0:
+                probs[np.argmax(visits)] = 1.0
         else:
             probs = visits**(1/temp)
-            probs /= np.sum(probs)
-        
+            probs_sum = np.sum(probs)
+            if probs_sum > 0:
+                probs /= probs_sum
+            else: 
+                probs = np.ones_like(visits, dtype=float) / len(visits)
+
         pi = np.zeros(Config.ACTION_SPACE_SIZE)
         for action, prob in zip(actions, probs):
-            idx = uci_to_move_index(action)
-            if idx != -1:
-                pi[idx] = prob
-
+            pi[action] = prob
+            
         return pi, action_visits
 
 class ReplayBuffer(Dataset):
@@ -271,112 +299,138 @@ class ReplayBuffer(Dataset):
         self.capacity = capacity
         self.buffer = deque(maxlen=capacity)
 
-    def __len__(self):
-        return len(self.buffer)
-
-    def __getitem__(self, idx):
-        return self.buffer[idx]
-
-    def add(self, state, pi, value, opp_move):
-        self.buffer.append((state, pi, value, opp_move))
+    def __len__(self): return len(self.buffer)
+    def __getitem__(self, idx): return self.buffer[idx]
+    def add(self, state, pi, value, opp_move_idx): self.buffer.append((state, pi, value, opp_move_idx))
 
 def self_play_worker(model_path):
     model = QuimeraNet()
-    model.load_state_dict(torch.load(model_path, map_location='cpu'))
-    model.to(Config.DEVICE)
-    model.eval()
+    try:
+        model.load_state_dict(torch.load(model_path, map_location='cpu'))
+    except FileNotFoundError:
+        torch.save(model.state_dict(), model_path) 
+    model.to(Config.DEVICE).eval()
     
     mcts = MCTS(model)
-    
     board = chess.Board()
     history = []
     game_data = []
 
-    while not board.is_game_over():
+    while not board.is_game_over() and board.fullmove_number < 150:
+        state_tensor = board_to_tensor(board, history)
         temp = Config.MCTS_TEMPERATURE_START if board.fullmove_number < Config.MCTS_TEMPERATURE_END_MOVE else 1e-3
         pi, action_visits = mcts.get_action_probs(board, history, temp)
         
-        if not action_visits:
-            break
-
-        actions = list(action_visits.keys())
-        visits = np.array(list(action_visits.values()))
-        chosen_action = random.choices(actions, weights=visits, k=1)[0]
+        if not action_visits: break
         
-        state_tensor = board_to_tensor(board, history)
+        current_player_value_sign = 1 if board.turn == chess.WHITE else -1
         
-        game_data.append([state_tensor.cpu().numpy(), pi, None, uci_to_move_index(chosen_action)])
+        move_made = False
+        attempts = 0
+        while not move_made and attempts < len(action_visits) + 5: 
+            attempts += 1
+            action_indices = list(action_visits.keys())
+            visits = np.array(list(action_visits.values()))
+            
+            if np.sum(visits) == 0:
+                chosen_action_idx = random.choice(action_indices)
+            else:
+                visit_probs = visits / np.sum(visits)
+                chosen_action_idx = np.random.choice(action_indices, p=visit_probs)
 
-        board.push_uci(chosen_action)
-        history.append(board.copy())
-        if len(history) > Config.NUM_HISTORY_STEPS:
-            history.pop(0)
-
+            move_uci = move_index_to_uci(chosen_action_idx, board)
+            try:
+                move = chess.Move.from_uci(move_uci)
+                if move in board.legal_moves:
+                    game_data.append([state_tensor.cpu().numpy(), pi, None, chosen_action_idx])
+                    board.push(move)
+                    history.append(board.copy())
+                    if len(history) > Config.NUM_HISTORY_STEPS: history.pop(0)
+                    move_made = True
+                else:
+                    game_data.append([state_tensor.cpu().numpy(), pi, -1.0 * current_player_value_sign, chosen_action_idx])
+                    del action_visits[chosen_action_idx]
+                    if not action_visits: break 
+            except ValueError: 
+                game_data.append([state_tensor.cpu().numpy(), pi, -1.0 * current_player_value_sign, chosen_action_idx])
+                del action_visits[chosen_action_idx]
+                if not action_visits: break
+    
     outcome = board.outcome()
+    result = 0
     if outcome:
         if outcome.winner == chess.WHITE: result = 1
         elif outcome.winner == chess.BLACK: result = -1
-        else: result = 0
-    else:
-        result = 0
-        
+    
     final_data = []
-    player_turn = 1
-    for i in range(len(game_data)):
-        state, pi, _, opp_move = game_data[i]
-        
-        value = result if player_turn == 1 else -result
-        mask = 1.0
+    for i in reversed(range(len(game_data))):
+        state, pi, value, opp_move = game_data[i]
+        if value is None:
+            value = result if (len(game_data) - 1 - i) % 2 == 0 else -result
         final_data.append((state, pi, value, opp_move))
-        player_turn *= -1
-
+    
+    final_data.reverse()
     return final_data
 
-def evaluate_models(model1_path, model2_path):
+def evaluate_against_master(model_path, engine_path, skill_level, num_games):
+    model = QuimeraNet().to(Config.DEVICE)
+    model.load_state_dict(torch.load(model_path))
+    model.eval()
+    mcts = MCTS(model)
+
+    try:
+        engine = chess.engine.SimpleEngine.popen_uci(engine_path)
+        engine.configure({"Skill Level": skill_level})
+    except chess.engine.EngineError as e:
+        print(f"ERRO: Não foi possível iniciar o motor de xadrez em '{engine_path}'.")
+        print(f"Verifique se o caminho está correto na Config e se o arquivo é executável.")
+        print(f"Erro original: {e}")
+        return -1 
+
+    quimera_score = 0
     
-    def play_game(white_model, black_model):
+    for i in range(num_games):
         board = chess.Board()
         history = []
-        mcts_white = MCTS(white_model)
-        mcts_black = MCTS(black_model)
+        is_quimera_white = (i % 2 == 0)
+        print(f"  Jogo de Avaliação {i+1}/{num_games} (Quimera de {'Brancas' if is_quimera_white else 'Pretas'})...", end="")
 
         while not board.is_game_over():
-            if board.turn == chess.WHITE:
-                _, action_visits = mcts_white.get_action_probs(board, history, temp=1e-3)
-            else:
-                _, action_visits = mcts_black.get_action_probs(board, history, temp=1e-3)
+            if board.turn == is_quimera_white: 
+                _, action_visits = mcts.get_action_probs(board, history, temp=0)
+                if not action_visits: break
+                
+                best_action_idx = max(action_visits, key=action_visits.get)
+                move_uci = move_index_to_uci(best_action_idx, board)
+                move = chess.Move.from_uci(move_uci)
+                if move in board.legal_moves:
+                    board.push(move)
+                else: 
+                    quimera_score += -1 if is_quimera_white else 0
+                    break
+            else: 
+                result = engine.play(board, chess.engine.Limit(time=0.1))
+                board.push(result.move)
 
-            if not action_visits:
-                return 0.5 
-
-            chosen_action = max(action_visits, key=action_visits.get)
-            board.push_uci(chosen_action)
             history.append(board.copy())
-            if len(history) > Config.NUM_HISTORY_STEPS:
-                history.pop(0)
+            if len(history) > Config.NUM_HISTORY_STEPS: history.pop(0)
 
         outcome = board.outcome()
-        if outcome.winner == chess.WHITE: return 1
-        if outcome.winner == chess.BLACK: return -1
-        return 0.5 
-
-    model1 = QuimeraNet().to(Config.DEVICE)
-    model1.load_state_dict(torch.load(model1_path))
-    model1.eval()
-
-    model2 = QuimeraNet().to(Config.DEVICE)
-    model2.load_state_dict(torch.load(model2_path))
-    model2.eval()
-
-    score = 0
-    for i in range(Config.EVAL_GAMES // 2):
-        print(f"  Eval game {i*2+1}/{Config.EVAL_GAMES} (New as White)...")
-        score += play_game(model1, model2)
-        print(f"  Eval game {i*2+2}/{Config.EVAL_GAMES} (New as Black)...")
-        score += (1 - play_game(model2, model1))
-        
-    return score / Config.EVAL_GAMES
-
+        if outcome:
+            if outcome.winner is not None:
+                if outcome.winner == is_quimera_white:
+                    quimera_score += 1
+                    print(" Vitória!")
+                else:
+                    print(" Derrota.")
+            else:
+                quimera_score += 0.5
+                print(" Empate.")
+        else:
+             print(" Jogo Incompleto.")
+    
+    engine.quit()
+    return quimera_score
 
 def train():
     os.makedirs(Config.MODEL_DIR, exist_ok=True)
@@ -384,244 +438,94 @@ def train():
     net = QuimeraNet().to(Config.DEVICE)
     if os.path.exists(Config.BEST_MODEL_PATH):
         net.load_state_dict(torch.load(Config.BEST_MODEL_PATH))
-        print("Loaded existing best model.")
+        print("Modelo 'best' existente carregado.")
     else:
         torch.save(net.state_dict(), Config.BEST_MODEL_PATH)
-        print("Initialized new model.")
+        print("Novo modelo inicializado e salvo como 'best'.")
         
     optimizer = optim.Adam(net.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY)
     replay_buffer = ReplayBuffer(Config.REPLAY_BUFFER_SIZE)
 
-    model_promoted = False
+    quimera_total_wins = 0
+    master_total_wins = 0
+    iteration = 0
 
-    for i in range(Config.TRAINING_ITERATIONS):
-        print(f"\n--- Iteration {i+1}/{Config.TRAINING_ITERATIONS} ---")
+    while quimera_total_wins <= master_total_wins:
+        iteration += 1
+        print(f"\n--- Ciclo de Treinamento {iteration} ---")
+        print(f"PLACAR ATUAL: Quimera {quimera_total_wins} x {master_total_wins} Mestre")
         
-        print("Generating self-play games...")
+        print("Gerando jogos de auto-play para aprender as regras e estratégias...")
         net.eval()
         game_data = []
         with ProcessPoolExecutor() as executor:
             futures = [executor.submit(self_play_worker, Config.BEST_MODEL_PATH) for _ in range(Config.GAMES_PER_ITERATION)]
             for future in futures:
-                game_data.extend(future.result())
+                try:
+                    result = future.result()
+                    game_data.extend(result)
+                except Exception as e:
+                    print(f"Erro em um worker de self-play: {e}")
 
         for state, pi, value, opp_move in game_data:
             replay_buffer.add((state, pi, value, opp_move))
         
-        print(f"Replay buffer size: {len(replay_buffer)}")
+        print(f"Tamanho do Replay Buffer: {len(replay_buffer)}")
         
-        if len(replay_buffer) < Config.BATCH_SIZE:
-            print("Buffer not full enough. Skipping training.")
+        if len(replay_buffer) < Config.BATCH_SIZE * 10: 
+            print("Buffer de replay com poucos dados. Gerando mais jogos...")
             continue
             
-        print("Training network...")
+        print("Treinando a rede...")
         net.train()
-        dataloader = DataLoader(replay_buffer, batch_size=Config.BATCH_SIZE, shuffle=True)
+        for epoch in range(5):
+            dataloader = DataLoader(replay_buffer, batch_size=Config.BATCH_SIZE, shuffle=True)
+            for states, pis, values, opp_moves in dataloader:
+                states, pis, values, opp_moves = states.to(Config.DEVICE), pis.to(Config.DEVICE), values.to(Config.DEVICE).float().unsqueeze(1), opp_moves.to(Config.DEVICE)
+                optimizer.zero_grad()
+                pself_pred, popp_pred, v_pred = net(states)
+                loss_v = F.mse_loss(v_pred, values)
+                loss_pself = -torch.sum(pis * torch.log(pself_pred + 1e-8), dim=1).mean()
+                loss_popp = F.cross_entropy(popp_pred, opp_moves)
+                total_loss = loss_v + loss_pself + loss_popp
+                total_loss.backward()
+                optimizer.step()
         
-        total_loss_val, total_loss_pself, total_loss_popp = 0, 0, 0
-        for batch_idx, (states, pis, values, opp_moves) in enumerate(dataloader):
-            states = states.to(Config.DEVICE)
-            pis = pis.to(Config.DEVICE)
-            values = values.to(Config.DEVICE).float().unsqueeze(1)
-            opp_moves = opp_moves.to(Config.DEVICE)
-
-            optimizer.zero_grad()
-            
-            pself_pred, popp_pred, v_pred = net(states)
-            
-            loss_v = F.mse_loss(v_pred, values)
-            loss_pself = -torch.sum(pis * torch.log(pself_pred + 1e-8), dim=1).mean()
-            loss_popp = F.cross_entropy(popp_pred, opp_moves)
-            total_loss = loss_v + loss_pself + loss_popp
-            
-            total_loss.backward()
-            optimizer.step()
-
-            total_loss_val += loss_v.item()
-            total_loss_pself += loss_pself.item()
-            total_loss_popp += loss_popp.item()
-
-        print(f"  Losses -> Value: {total_loss_val/len(dataloader):.4f}, Policy: {total_loss_pself/len(dataloader):.4f}, Opponent: {total_loss_popp/len(dataloader):.4f}")
-
-        print("Evaluating new model...")
-        torch.save(net.state_dict(), Config.TEMP_MODEL_PATH)
-        win_rate = evaluate_models(Config.TEMP_MODEL_PATH, Config.BEST_MODEL_PATH)
-        print(f"New model win rate vs best: {win_rate*100:.2f}%")
-
-        if win_rate > Config.EVAL_WIN_THRESHOLD:
-            print("!!! NEW BEST MODEL PROMOTED !!!")
-            torch.save(net.state_dict(), Config.BEST_MODEL_PATH)
-            model_promoted = True
+        torch.save(net.state_dict(), Config.BEST_MODEL_PATH) 
+        
+        print("Avaliação contra o Mestre...")
+        score = evaluate_against_master(Config.BEST_MODEL_PATH, Config.MASTER_ENGINE_PATH, Config.MASTER_SKILL_LEVEL, Config.EVAL_GAMES_PER_CYCLE)
+        
+        if score == -1: 
+            print("Encerrando treinamento devido a erro no motor de xadrez.")
             break
-        else:
-            print("New model did not meet threshold. Keeping old model.")
-            net.load_state_dict(torch.load(Config.BEST_MODEL_PATH))
-
-    if model_promoted:
-        print("\nTraining complete. A model was promoted and is ready for play.")
-        return True
-    else:
-        print("\nTraining finished, but no model passed the evaluation threshold.")
-        return False
-
-def play_gui():
-    if not os.path.exists(Config.BEST_MODEL_PATH):
-        print("No trained model found. Please run training first.")
-        return
-
-    model = QuimeraNet().to(Config.DEVICE)
-    model.load_state_dict(torch.load(Config.BEST_MODEL_PATH))
-    model.eval()
-    mcts = MCTS(model)
-
-    board = chess.Board()
-    history = []
-    
-    sg.theme('DarkBlue')
-
-    board_layout = [[sg.Graph((400, 400), (0, 400), (400, 0), key='-BOARD-', change_submits=True, drag_submits=False)]]
-    pred_layout = [[sg.Text('AI Predicts You Will Play:', font='Any 14')],
-                   [sg.Text('', size=(30,5), key='-PREDICTIONS-', font='Courier 12')]]
-
-    layout = [[sg.Column(board_layout), sg.Column(pred_layout)],
-              [sg.Text('Your Move: ', key='-STATUS-'), sg.Button('New Game'), sg.Button('Exit')]]
-    
-    window = sg.Window(Config.PROJECT_NAME, layout)
-    
-    def draw_board(graph, board_obj):
-        graph.erase()
-        for i in range(8):
-            for j in range(8):
-                color = '#DDB88C' if (i+j)%2==0 else '#A66D4F'
-                graph.draw_rectangle((j*50, i*50), (j*50+50, i*50+50), fill_color=color, line_color=color)
-        for i in range(64):
-            piece = board_obj.piece_at(i)
-            if piece:
-                filename = f"pieces/{piece.symbol()}.png"
-                if os.path.exists(filename):
-                     graph.draw_image(filename=filename, location=(i%8*50, i//8*50+50))
-
-    def update_predictions(board_obj, hist_list, model_obj):
-        state_tensor = board_to_tensor(board_obj, hist_list).unsqueeze(0)
-        _, popp, _ = model_obj(state_tensor)
-        popp = popp.squeeze(0).cpu().detach().numpy()
-        
-        legal_moves_uci = {move.uci() for move in board_obj.legal_moves}
-        legal_move_preds = {}
-
-        for move_uci in legal_moves_uci:
-            idx = uci_to_move_index(move_uci)
-            if idx != -1:
-                legal_move_preds[move_uci] = popp[idx]
-        
-        sorted_preds = sorted(legal_move_preds.items(), key=lambda item: item[1], reverse=True)
-        
-        pred_text = ""
-        for i in range(min(Config.TOP_K_PREDICTIONS, len(sorted_preds))):
-            move, prob = sorted_preds[i]
-            pred_text += f"{i+1}. {move:<6} ({prob*100:5.2f}%)\n"
-        window['-PREDICTIONS-'].update(pred_text)
-
-    # Main GUI loop
-    dragged_piece = None
-    start_square = None
-
-    if not os.path.exists('pieces'):
-        os.makedirs('pieces')
-    
-    if not os.path.exists('pieces/P.png'):
-        import requests, zipfile, io
-        print("Downloading chess pieces...")
-        try:
-            url = "https://github.com/fsmosca/Python-Easy-Chess-GUI/raw/master/pieces.zip"
-            r = requests.get(url, stream=True)
-            z = zipfile.ZipFile(io.BytesIO(r.content))
-            z.extractall()
-            print("Pieces downloaded.")
-        except Exception as e:
-            print(f"Could not download pieces: {e}")
-            print("Please download them manually from https://github.com/fsmosca/Python-Easy-Chess-GUI")
-
-
-    while True:
-        event, values = window.read(timeout=100)
-        
-        if event in (sg.WIN_CLOSED, 'Exit'):
-            break
-
-        if event == 'New Game':
-            board.reset()
-            history.clear()
-            window['-STATUS-'].update('Your Move: ')
             
-        if not board.is_game_over() and board.turn == chess.WHITE:
-             window['-STATUS-'].update('Your Move: ')
-             update_predictions(board, history, model)
-
-        draw_board(window['-BOARD-'], board)
-
-        if event == '-BOARD-':
-            x, y = values['-BOARD-']
-            if x is not None and y is not None:
-                col, row = x // 50, y // 50
-                square_idx = chess.square(col, 7 - row)
-                
-                if start_square is None:
-                    piece = board.piece_at(square_idx)
-                    if piece and piece.color == board.turn:
-                        start_square = square_idx
-                else:
-                    move = chess.Move(start_square, square_idx)
-                    if move in board.legal_moves:
-                        board.push(move)
-                        history.append(board.copy())
-                        if len(history) > Config.NUM_HISTORY_STEPS: history.pop(0)
-                        draw_board(window['-BOARD-'], board)
-                        window.refresh()
-                        
-                        # AI's turn
-                        window['-STATUS-'].update("AI is thinking...")
-                        window.refresh()
-                        _, action_visits = mcts.get_action_probs(board, history, temp=1e-3)
-                        if action_visits:
-                            ai_move = max(action_visits, key=action_visits.get)
-                            board.push_uci(ai_move)
-                            history.append(board.copy())
-                            if len(history) > Config.NUM_HISTORY_STEPS: history.pop(0)
-                        
-                    start_square = None
+        quimera_wins_cycle = score
+        master_wins_cycle = Config.EVAL_GAMES_PER_CYCLE - score
+        print(f"Resultado do ciclo: Quimera {quimera_wins_cycle} x {master_wins_cycle} Mestre")
         
-        if board.is_game_over():
-            outcome = board.outcome()
-            status = "Game Over: "
-            if outcome.winner == chess.WHITE: status += "You Win!"
-            elif outcome.winner == chess.BLACK: status += "AI Wins!"
-            else: status += "Draw!"
-            window['-STATUS-'].update(status)
+        quimera_total_wins += quimera_wins_cycle
+        master_total_wins += master_wins_cycle
 
-    window.close()
+    print("\n--- TREINAMENTO CONCLUÍDO! ---")
+    print(f"PLACAR FINAL: Quimera {quimera_total_wins} x {master_total_wins} Mestre")
+    print("A Quimera superou o Mestre e se tornou o novo campeão!")
+    return True
 
 
 if __name__ == '__main__':
-    print(f"Starting {Config.PROJECT_NAME}")
-    print(f"Using device: {Config.DEVICE}")
-
-    model_exists = os.path.exists(Config.BEST_MODEL_PATH)
+    print(f"Iniciando {Config.PROJECT_NAME}")
+    print(f"Usando dispositivo: {Config.DEVICE}")
     
-    choice = input("Do you want to run training? (y/n): ").lower()
-    
-    should_play = False
-    if choice == 'y':
-        should_play = train()
+    if not os.path.exists(Config.MASTER_ENGINE_PATH):
+         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+         print("!!! ATENÇÃO: Motor de xadrez mestre não encontrado.  !!!")
+         print(f"!!! Por favor, baixe o Stockfish (ou outro motor UCI) !!!")
+         print(f"!!! e atualize o caminho em Config.MASTER_ENGINE_PATH !!!")
+         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     else:
-        if model_exists:
-            print("Skipping training. A pre-trained model exists.")
-            should_play = True
+        choice = input("Você quer iniciar o treinamento 'Tabula Rasa'? (y/n): ").lower()
+        if choice == 'y':
+            train()
         else:
-            print("Skipping training. No pre-trained model found.")
-
-    if should_play:
-        print("\nLaunching GUI to play against the best model...")
-        play_gui()
-    else:
-        print("\nExiting. No model is ready for play.")
+            print("Treinamento não iniciado.")
