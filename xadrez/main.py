@@ -17,7 +17,7 @@ from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 
 class Config:
-    PROJECT_NAME = "Projeto Quimera 2.0 - Tabula Rasa"
+    PROJECT_NAME = "Projeto Quimera - Tabula Rasa"
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     MASTER_ENGINE_PATH = "stockfish"
